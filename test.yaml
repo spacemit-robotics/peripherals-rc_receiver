@@ -1,0 +1,104 @@
+## Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+## SPDX-License-Identifier: Apache-2.0
+
+module: components/peripherals/rc_receiver
+
+tests:
+  - name: rc-receiver-parser
+    description: >-
+      Verifies SBUS channel unpacking, S.Bus2 footer handling, status flags and
+      invalid-frame recovery with synthetic byte streams.
+    category: functional
+    scopes: [pr, scheduled]
+    timeout_s: 120
+    workdir: sdk
+    artifacts:
+      - output/test/pr/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_parser.log
+      - output/test/scheduled/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_parser.log
+    command: |
+      build_dir="${SROBOTIS_TEST_ARTIFACT_DIR:-output/test-artifacts}/rc_receiver_parser"
+      cmake -S components/peripherals/rc_receiver -B "${build_dir}" \
+        -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+      cmake --build "${build_dir}"
+      ctest --test-dir "${build_dir}" --output-on-failure \
+        -R '^rc_receiver_sbus_parser$'
+
+  - name: rc-receiver-api-functional
+    description: >-
+      Verifies public-header linkage, normalized frame delivery through the
+      callback API, callback shutdown and the retained non-blocking polling API.
+    category: functional
+    scopes: [pr, scheduled]
+    timeout_s: 120
+    workdir: sdk
+    artifacts:
+      - output/test/pr/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_api_functional.log
+      - output/test/scheduled/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_api_functional.log
+    command: |
+      build_dir="${SROBOTIS_TEST_ARTIFACT_DIR:-output/test-artifacts}/rc_receiver_api_functional"
+      cmake -S components/peripherals/rc_receiver -B "${build_dir}" \
+        -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+      cmake --build "${build_dir}"
+      ctest --test-dir "${build_dir}" --output-on-failure \
+        -R '^rc_receiver_(api_contract|callback_functional)$'
+
+  - name: rc-receiver-error-paths
+    description: >-
+      Verifies invalid driver names, null handles, missing driver operations,
+      a missing UART device, read failures and rejection of polling while
+      callback delivery is active.
+    category: functional
+    scopes: [pr, scheduled]
+    timeout_s: 120
+    workdir: sdk
+    artifacts:
+      - output/test/pr/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_error_paths.log
+      - output/test/scheduled/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_error_paths.log
+    command: |
+      build_dir="${SROBOTIS_TEST_ARTIFACT_DIR:-output/test-artifacts}/rc_receiver_error_paths"
+      cmake -S components/peripherals/rc_receiver -B "${build_dir}" \
+        -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+      cmake --build "${build_dir}"
+      ctest --test-dir "${build_dir}" --output-on-failure \
+        -R '^rc_receiver_error_paths$'
+
+  - name: rc-receiver-callback-stability
+    description: >-
+      Repeats callback start, frame delivery and callback stop 100 times, and
+      verifies that every cycle delivers exactly one frame without stale calls.
+    category: stability
+    scopes: [scheduled, release]
+    timeout_s: 300
+    workdir: sdk
+    artifacts:
+      - output/test/scheduled/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_callback_stability.log
+      - output/test/release/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_callback_stability.log
+    command: |
+      build_dir="${SROBOTIS_TEST_ARTIFACT_DIR:-output/test-artifacts}/rc_receiver_callback_stability"
+      cmake -S components/peripherals/rc_receiver -B "${build_dir}" \
+        -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+      cmake --build "${build_dir}"
+      ctest --test-dir "${build_dir}" --output-on-failure \
+        -R '^rc_receiver_callback_stability$'
+
+  - name: rc-receiver-uart-hardware-smoke
+    description: >-
+      Manually verifies that a real inverted SBUS source is readable at the
+      configured UART and produces complete frames with normalized CH1-CH16
+      values. Products may use a smaller channel mapping.
+    category: functional
+    scopes: [manual]
+    timeout_s: 120
+    workdir: sdk
+    requires:
+      hardware:
+        - >-
+          SBUS receiver connected through an external inverter to the target
+          UART RX. Export RC_RECEIVER_DEVICE and RC_RECEIVER_TEST_BINARY when
+          the defaults (/dev/ttyS5 and output/staging/bin/test_rc_receiver) do
+          not apply.
+      supervision: true
+    artifacts:
+      - output/test/manual/components__peripherals__rc_receiver/modules/components__peripherals__rc_receiver/logs/rc_receiver_uart_hardware_smoke.log
+    command: |
+      bash components/peripherals/rc_receiver/tests/test_hw_sbus_uart_smoke.sh
