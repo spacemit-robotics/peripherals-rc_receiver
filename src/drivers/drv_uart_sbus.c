@@ -14,8 +14,6 @@
 #include <asm/termbits.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -31,7 +29,6 @@
 #define RC_RECEIVER_SBUS_DEFAULT_BAUDRATE 100000U
 #define RC_RECEIVER_SBUS_READ_BUFFER_SIZE 512U
 #define RC_RECEIVER_SBUS_REOPEN_DELAY_MS 1000U
-#define RC_RECEIVER_SBUS_CALLBACK_WAIT_MS 100
 #define RC_RECEIVER_SBUS_STATUS_OFFSET 23U
 #define RC_RECEIVER_SBUS_CLASSIC_FOOTER 0x00U
 #define RC_RECEIVER_SBUS2_FOOTER_MASK 0x0FU
@@ -74,11 +71,6 @@ struct rc_receiver_sbus_priv {
     uint64_t next_open_attempt_ms;
     int last_error;
     rc_receiver_sbus_parser_t *parser;
-    pthread_t callback_thread;
-    pthread_mutex_t callback_lock;
-    uint8_t callback_lock_valid;
-    uint8_t callback_thread_running;
-    uint8_t callback_thread_stop;
 };
 
 static char *duplicate_string(const char *value)
@@ -429,159 +421,41 @@ static int sbus_read(struct rc_receiver *receiver,
     }
 }
 
-static uint8_t callback_should_stop(struct rc_receiver_sbus_priv *priv)
+static int sbus_event_start(struct rc_receiver *receiver)
 {
-    uint8_t stop;
-
-    (void)pthread_mutex_lock(&priv->callback_lock);
-    stop = priv->callback_thread_stop;
-    (void)pthread_mutex_unlock(&priv->callback_lock);
-    return stop;
+    struct rc_receiver_sbus_priv *priv = receiver->priv_data;
+    if (priv->fd < 0) {
+        priv->next_open_attempt_ms = 0;
+        if (open_port(priv) <= 0) return -(priv->last_error ? priv->last_error : EIO);
+    }
+    rc_receiver_sbus_parser_reset(priv->parser);
+    return priv->fd;
 }
 
-static void deliver_callback_frame(struct rc_receiver *receiver,
-        const struct rc_receiver_frame *frame)
+static int sbus_event_read(struct rc_receiver *receiver,
+        struct rc_receiver_frame *frame)
 {
-    struct rc_receiver_sbus_priv *priv =
-        (struct rc_receiver_sbus_priv *)receiver->priv_data;
-    rc_receiver_callback_t callback;
-    void *context;
-    uint8_t stop;
-
-    (void)pthread_mutex_lock(&priv->callback_lock);
-    stop = priv->callback_thread_stop;
-    (void)pthread_mutex_unlock(&priv->callback_lock);
-    callback = receiver->callback;
-    context = receiver->callback_context;
-    if (stop == 0U && callback != NULL) {
-        callback(receiver, frame, context);
+    struct rc_receiver_sbus_priv *priv = receiver->priv_data;
+    uint8_t buffer[RC_RECEIVER_SBUS_READ_BUFFER_SIZE];
+    ssize_t count;
+    do {
+        count = read(priv->fd, buffer, sizeof(buffer));
+    } while (count < 0 && errno == EINTR);
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return RC_RECEIVER_NO_DATA;
+    if (count <= 0) {
+        priv->last_error = count < 0 ? errno : EIO;
+        return RC_RECEIVER_ERROR;
     }
+    int result = rc_receiver_sbus_parser_feed(priv->parser, buffer, (size_t)count, frame);
+    if (result == RC_RECEIVER_FRAME) frame->timestamp_us = monotonic_us();
+    return result;
 }
 
-static void *sbus_callback_worker(void *arg)
+static void sbus_event_stop(struct rc_receiver *receiver)
 {
-    struct rc_receiver *receiver = (struct rc_receiver *)arg;
-    struct rc_receiver_sbus_priv *priv =
-        (struct rc_receiver_sbus_priv *)receiver->priv_data;
-
-    while (callback_should_stop(priv) == 0U) {
-        struct pollfd event;
-        struct rc_receiver_frame frame;
-        int poll_result;
-
-        if (priv->fd < 0) {
-            if (open_port(priv) <= 0) {
-                (void)poll(NULL, 0U, RC_RECEIVER_SBUS_CALLBACK_WAIT_MS);
-                continue;
-            }
-        }
-
-        event.fd = priv->fd;
-        event.events = POLLIN | POLLERR | POLLHUP;
-        event.revents = 0;
-        do {
-            poll_result = poll(&event, 1U,
-                    RC_RECEIVER_SBUS_CALLBACK_WAIT_MS);
-        } while (poll_result < 0 && errno == EINTR);
-
-        if (poll_result == 0) {
-            continue;
-        }
-        if (poll_result < 0) {
-            priv->last_error = errno;
-            close_port(priv);
-            priv->next_open_attempt_ms = monotonic_ms() +
-                RC_RECEIVER_SBUS_REOPEN_DELAY_MS;
-            continue;
-        }
-        if ((event.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            priv->last_error = EIO;
-            close_port(priv);
-            priv->next_open_attempt_ms = monotonic_ms() +
-                RC_RECEIVER_SBUS_REOPEN_DELAY_MS;
-            continue;
-        }
-        if ((event.revents & POLLIN) != 0 &&
-                sbus_read(receiver, &frame) == RC_RECEIVER_FRAME) {
-            deliver_callback_frame(receiver, &frame);
-        }
-    }
-
-    (void)pthread_mutex_lock(&priv->callback_lock);
-    priv->callback_thread_running = 0U;
-    (void)pthread_mutex_unlock(&priv->callback_lock);
-    return NULL;
-}
-
-static int stop_callback_thread(struct rc_receiver_sbus_priv *priv)
-{
-    pthread_t thread;
-    int join_result;
-
-    if (priv == NULL || priv->callback_lock_valid == 0U) {
-        return 0;
-    }
-    if (pthread_mutex_lock(&priv->callback_lock) != 0) {
-        return RC_RECEIVER_ERROR;
-    }
-    if (priv->callback_thread_running == 0U) {
-        priv->callback_thread_stop = 0U;
-        (void)pthread_mutex_unlock(&priv->callback_lock);
-        return 0;
-    }
-    if (pthread_equal(pthread_self(), priv->callback_thread) != 0) {
-        (void)pthread_mutex_unlock(&priv->callback_lock);
-        return RC_RECEIVER_ERROR;
-    }
-
-    priv->callback_thread_stop = 1U;
-    thread = priv->callback_thread;
-    (void)pthread_mutex_unlock(&priv->callback_lock);
-
-    join_result = pthread_join(thread, NULL);
-    if (join_result != 0) {
-        return RC_RECEIVER_ERROR;
-    }
-
-    (void)pthread_mutex_lock(&priv->callback_lock);
-    priv->callback_thread_running = 0U;
-    priv->callback_thread_stop = 0U;
-    (void)pthread_mutex_unlock(&priv->callback_lock);
-    return 0;
-}
-
-static int sbus_set_callback(struct rc_receiver *receiver,
-        rc_receiver_callback_t callback, void *context)
-{
-    struct rc_receiver_sbus_priv *priv;
-    int create_result;
-
-    if (receiver == NULL || receiver->priv_data == NULL) {
-        return RC_RECEIVER_ERROR;
-    }
-    priv = (struct rc_receiver_sbus_priv *)receiver->priv_data;
-    if (priv->callback_lock_valid == 0U ||
-            stop_callback_thread(priv) != 0) {
-        return RC_RECEIVER_ERROR;
-    }
-    if (callback == NULL) {
-        return 0;
-    }
-    (void)context;
-
-    if (pthread_mutex_lock(&priv->callback_lock) != 0) {
-        return RC_RECEIVER_ERROR;
-    }
-    priv->callback_thread_stop = 0U;
-    priv->callback_thread_running = 1U;
-    create_result = pthread_create(&priv->callback_thread, NULL,
-            sbus_callback_worker, receiver);
-    if (create_result != 0) {
-        priv->callback_thread_running = 0U;
-        priv->last_error = create_result;
-    }
-    (void)pthread_mutex_unlock(&priv->callback_lock);
-    return create_result == 0 ? 0 : RC_RECEIVER_ERROR;
+    /* The event fd is borrowed from the synchronous transport. */
+    (void)receiver;
 }
 
 static void sbus_close(struct rc_receiver *receiver)
@@ -600,14 +474,7 @@ static void sbus_free(struct rc_receiver *receiver)
     }
     priv = (struct rc_receiver_sbus_priv *)receiver->priv_data;
     if (priv != NULL) {
-        if (stop_callback_thread(priv) != 0) {
-            return;
-        }
         close_port(priv);
-        if (priv->callback_lock_valid != 0U) {
-            (void)pthread_mutex_destroy(&priv->callback_lock);
-            priv->callback_lock_valid = 0U;
-        }
         rc_receiver_sbus_parser_destroy(priv->parser);
         free(priv->device);
         free(priv);
@@ -654,7 +521,9 @@ static const struct rc_receiver_ops sbus_ops = {
     .init = sbus_init,
     .read = sbus_read,
     .free = sbus_free,
-    .set_callback = sbus_set_callback,
+    .event_start = sbus_event_start,
+    .event_read = sbus_event_read,
+    .event_stop = sbus_event_stop,
     .close = sbus_close,
     .is_open = sbus_is_open,
     .invalid_frames = sbus_invalid_frames,
@@ -703,12 +572,6 @@ static struct rc_receiver *sbus_create(void *raw_args)
         rc_receiver_free(receiver);
         return NULL;
     }
-    priv->last_error = pthread_mutex_init(&priv->callback_lock, NULL);
-    if (priv->last_error != 0) {
-        rc_receiver_free(receiver);
-        return NULL;
-    }
-    priv->callback_lock_valid = 1U;
     return receiver;
 }
 

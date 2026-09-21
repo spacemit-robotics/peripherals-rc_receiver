@@ -11,6 +11,7 @@
 #include "rc_receiver.h"
 
 #include <stddef.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,8 +36,10 @@ struct rc_receiver_ops {
     void (*free)(struct rc_receiver *receiver);
 
     /* --- optional transport and diagnostic operations --- */
-    int (*set_callback)(struct rc_receiver *receiver,
-            rc_receiver_callback_t callback, void *context);
+    int (*event_start)(struct rc_receiver *receiver);
+    int (*event_read)(struct rc_receiver *receiver,
+            struct rc_receiver_frame *frame);
+    void (*event_stop)(struct rc_receiver *receiver);
     void (*close)(struct rc_receiver *receiver);
     uint8_t (*is_open)(const struct rc_receiver *receiver);
     uint64_t (*invalid_frames)(const struct rc_receiver *receiver);
@@ -49,6 +52,15 @@ struct rc_receiver {
     void *priv_data;
     rc_receiver_callback_t callback;
     void *callback_context;
+    pthread_mutex_t state_lock;
+    pthread_mutex_t io_lock;
+    pthread_t worker;
+    int initialized;
+    int worker_valid;
+    int stop_fd;
+    int event_fd;
+    int callback_error;
+    enum { RC_SYNC, RC_ACTIVE, RC_STOPPING, RC_FAULT } mode;
 };
 
 typedef struct rc_receiver *(*rc_receiver_factory_t)(void *args);
