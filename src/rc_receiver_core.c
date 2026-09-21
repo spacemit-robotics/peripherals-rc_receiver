@@ -9,6 +9,11 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <poll.h>
+#include <stdio.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 static struct rc_receiver_driver_info *g_driver_list;
 
@@ -121,6 +126,21 @@ struct rc_receiver *rc_receiver_dev_alloc(const char *instance,
         }
     }
 
+    receiver->stop_fd = -1;
+    receiver->event_fd = -1;
+    if (pthread_mutex_init(&receiver->state_lock, NULL) != 0) {
+        free(receiver->priv_data);
+        free(receiver->name);
+        free(receiver);
+        return NULL;
+    }
+    if (pthread_mutex_init(&receiver->io_lock, NULL) != 0) {
+        pthread_mutex_destroy(&receiver->state_lock);
+        free(receiver->priv_data);
+        free(receiver->name);
+        free(receiver);
+        return NULL;
+    }
     return receiver;
 }
 
@@ -151,23 +171,159 @@ struct rc_receiver *rc_receiver_alloc_uart(const char *name,
     return driver->factory(&args);
 }
 
-int rc_receiver_init(struct rc_receiver *receiver)
+/* Lifecycle calls are externally serialized. Only the worker can unregister
+ * concurrently; its self-unregister leaves the join to an external caller. */
+static int stop_worker(struct rc_receiver *receiver)
 {
-    if (receiver == NULL || receiver->ops == NULL ||
-            receiver->ops->init == NULL || receiver->callback != NULL) {
+    receiver->callback = NULL;
+    receiver->callback_context = NULL;
+    if (!receiver->worker_valid) return 0;
+    receiver->mode = RC_STOPPING;
+    uint64_t one = 1;
+    ssize_t written;
+    do {
+        written = write(receiver->stop_fd, &one, sizeof(one));
+    } while (written < 0 && errno == EINTR);
+    if (pthread_equal(pthread_self(), receiver->worker)) return 0;
+    pthread_mutex_unlock(&receiver->state_lock);
+    int result = pthread_join(receiver->worker, NULL);
+    pthread_mutex_lock(&receiver->state_lock);
+    if (result) return RC_RECEIVER_ERROR;
+    pthread_mutex_lock(&receiver->io_lock);
+    receiver->ops->event_stop(receiver);
+    pthread_mutex_unlock(&receiver->io_lock);
+    close(receiver->stop_fd);
+    receiver->stop_fd = -1;
+    receiver->event_fd = -1;
+    receiver->worker_valid = 0;
+    receiver->mode = RC_SYNC;
+    return 0;
+}
+
+static void *callback_worker(void *arg)
+{
+    struct rc_receiver *receiver = arg;
+    struct pollfd fds[2] = {
+        {receiver->event_fd, POLLIN, 0}, {receiver->stop_fd, POLLIN, 0}};
+    int error = 0;
+    for (;;) {
+        int ready = poll(fds, 2, -1);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) { error = errno; break; }
+        if (fds[1].revents) break;
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            error = EIO;
+            break;
+        }
+        if (!(fds[0].revents & POLLIN)) continue;
+        struct rc_receiver_frame frame;
+        pthread_mutex_lock(&receiver->state_lock);
+        if (receiver->mode != RC_ACTIVE) {
+            pthread_mutex_unlock(&receiver->state_lock);
+            break;
+        }
+        pthread_mutex_lock(&receiver->io_lock);
+        pthread_mutex_unlock(&receiver->state_lock);
+        int result = receiver->ops->event_read(receiver, &frame);
+        pthread_mutex_unlock(&receiver->io_lock);
+        if (result < 0) { error = EIO; break; }
+        if (result != RC_RECEIVER_FRAME) continue;
+        pthread_mutex_lock(&receiver->state_lock);
+        rc_receiver_callback_t cb = receiver->mode == RC_ACTIVE ? receiver->callback : NULL;
+        void *context = receiver->callback_context;
+        pthread_mutex_unlock(&receiver->state_lock);
+        if (cb) cb(receiver, &frame, context);
+    }
+    pthread_mutex_lock(&receiver->state_lock);
+    if (receiver->mode == RC_ACTIVE) {
+        receiver->mode = RC_FAULT;
+        receiver->callback_error = error ? error : EIO;
+        fprintf(stderr, "rc_receiver: callback fault (%d); unregister and reinitialize\n",
+                receiver->callback_error);
+    }
+    pthread_mutex_unlock(&receiver->state_lock);
+    return NULL;
+}
+
+static int start_worker(struct rc_receiver *receiver)
+{
+    int result;
+    if (!receiver->ops->event_start || !receiver->ops->event_read ||
+            !receiver->ops->event_stop) {
+        receiver->callback_error = ENOTSUP;
         return RC_RECEIVER_ERROR;
     }
-    return receiver->ops->init(receiver);
+    pthread_mutex_lock(&receiver->io_lock);
+    result = receiver->ops->event_start(receiver);
+    pthread_mutex_unlock(&receiver->io_lock);
+    if (result < 0) {
+        receiver->callback_error = -result;
+        return RC_RECEIVER_ERROR;
+    }
+    receiver->event_fd = result;
+    receiver->stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (receiver->stop_fd < 0) result = errno;
+    else {
+        receiver->mode = RC_ACTIVE;
+        result = pthread_create(&receiver->worker, NULL, callback_worker, receiver);
+    }
+    if (result) {
+        if (receiver->stop_fd >= 0) close(receiver->stop_fd);
+        receiver->stop_fd = -1;
+        receiver->event_fd = -1;
+        receiver->mode = RC_SYNC;
+        receiver->callback_error = result;
+        pthread_mutex_lock(&receiver->io_lock);
+        receiver->ops->event_stop(receiver);
+        pthread_mutex_unlock(&receiver->io_lock);
+        return RC_RECEIVER_ERROR;
+    }
+    receiver->callback_error = 0;
+    receiver->worker_valid = 1;
+    return 0;
+}
+
+int rc_receiver_init(struct rc_receiver *receiver)
+{
+    if (!receiver || !receiver->ops || !receiver->ops->init) return RC_RECEIVER_ERROR;
+    pthread_mutex_lock(&receiver->state_lock);
+    if (receiver->mode != RC_SYNC) {
+        pthread_mutex_unlock(&receiver->state_lock);
+        errno = EBUSY;
+        return RC_RECEIVER_ERROR;
+    }
+    pthread_mutex_lock(&receiver->io_lock);
+    int result = receiver->ops->init(receiver);
+    pthread_mutex_unlock(&receiver->io_lock);
+    receiver->initialized = result == 0;
+    receiver->callback_error = 0;
+    if (!result && receiver->callback) result = start_worker(receiver);
+    if (result) {
+        receiver->callback = NULL;
+        receiver->callback_context = NULL;
+    }
+    pthread_mutex_unlock(&receiver->state_lock);
+    return result;
 }
 
 int rc_receiver_read(struct rc_receiver *receiver,
         struct rc_receiver_frame *frame)
 {
     if (receiver == NULL || frame == NULL || receiver->ops == NULL ||
-            receiver->ops->read == NULL || receiver->callback != NULL) {
+            receiver->ops->read == NULL) {
         return RC_RECEIVER_ERROR;
     }
-    return receiver->ops->read(receiver, frame);
+    pthread_mutex_lock(&receiver->state_lock);
+    if (receiver->mode != RC_SYNC || !receiver->initialized) {
+        pthread_mutex_unlock(&receiver->state_lock);
+        errno = EBUSY;
+        return RC_RECEIVER_ERROR;
+    }
+    pthread_mutex_lock(&receiver->io_lock);
+    pthread_mutex_unlock(&receiver->state_lock);
+    int result = receiver->ops->read(receiver, frame);
+    pthread_mutex_unlock(&receiver->io_lock);
+    return result;
 }
 
 int rc_receiver_set_callback(struct rc_receiver *receiver,
@@ -179,30 +335,25 @@ int rc_receiver_set_callback(struct rc_receiver *receiver,
         return RC_RECEIVER_ERROR;
     }
 
-    if (receiver->callback != NULL) {
-        if (receiver->ops->set_callback == NULL ||
-                receiver->ops->set_callback(receiver, NULL, NULL) != 0) {
-            return RC_RECEIVER_ERROR;
+    pthread_mutex_lock(&receiver->state_lock);
+    if (callback && (receiver->mode == RC_FAULT ||
+            (receiver->worker_valid && pthread_equal(pthread_self(), receiver->worker)))) {
+        pthread_mutex_unlock(&receiver->state_lock);
+        errno = EBUSY;
+        return RC_RECEIVER_ERROR;
+    }
+    result = stop_worker(receiver);
+    if (!result && callback) {
+        receiver->callback = callback;
+        receiver->callback_context = context;
+        if (receiver->initialized) result = start_worker(receiver);
+        if (result) {
+            receiver->callback = NULL;
+            receiver->callback_context = NULL;
         }
-        receiver->callback = NULL;
-        receiver->callback_context = NULL;
     }
-    if (callback == NULL) {
-        return 0;
-    }
-    if (receiver->ops->read == NULL || receiver->ops->set_callback == NULL) {
-        return RC_RECEIVER_ERROR;
-    }
-
-    receiver->callback = callback;
-    receiver->callback_context = context;
-    result = receiver->ops->set_callback(receiver, callback, context);
-    if (result != 0) {
-        receiver->callback = NULL;
-        receiver->callback_context = NULL;
-        return RC_RECEIVER_ERROR;
-    }
-    return 0;
+    pthread_mutex_unlock(&receiver->state_lock);
+    return result;
 }
 
 void rc_receiver_free(struct rc_receiver *receiver)
@@ -211,10 +362,18 @@ void rc_receiver_free(struct rc_receiver *receiver)
         return;
     }
 
-    if (receiver->callback != NULL &&
-            rc_receiver_set_callback(receiver, NULL, NULL) != 0) {
+    pthread_mutex_lock(&receiver->state_lock);
+    if (receiver->worker_valid && pthread_equal(pthread_self(), receiver->worker)) {
+        pthread_mutex_unlock(&receiver->state_lock);
         return;
     }
+    int result = stop_worker(receiver);
+    pthread_mutex_unlock(&receiver->state_lock);
+    if (result) return;
+    pthread_mutex_lock(&receiver->io_lock);
+    pthread_mutex_unlock(&receiver->io_lock);
+    pthread_mutex_destroy(&receiver->io_lock);
+    pthread_mutex_destroy(&receiver->state_lock);
 
     if (receiver->ops != NULL && receiver->ops->free != NULL) {
         receiver->ops->free(receiver);
@@ -231,14 +390,22 @@ void rc_receiver_close(struct rc_receiver *receiver)
     if (receiver == NULL) {
         return;
     }
-    if (receiver->callback != NULL &&
-            rc_receiver_set_callback(receiver, NULL, NULL) != 0) {
+    pthread_mutex_lock(&receiver->state_lock);
+    if (receiver->worker_valid && pthread_equal(pthread_self(), receiver->worker)) {
+        pthread_mutex_unlock(&receiver->state_lock);
         return;
     }
+    if (stop_worker(receiver)) {
+        pthread_mutex_unlock(&receiver->state_lock);
+        return;
+    }
+    pthread_mutex_lock(&receiver->io_lock);
     if (receiver->ops != NULL &&
             receiver->ops->close != NULL) {
         receiver->ops->close(receiver);
     }
+    pthread_mutex_unlock(&receiver->io_lock);
+    pthread_mutex_unlock(&receiver->state_lock);
 }
 
 uint8_t rc_receiver_is_open(const struct rc_receiver *receiver)
@@ -247,7 +414,11 @@ uint8_t rc_receiver_is_open(const struct rc_receiver *receiver)
             receiver->ops->is_open == NULL) {
         return 0U;
     }
-    return receiver->ops->is_open(receiver);
+    pthread_mutex_t *lock = (pthread_mutex_t *)&receiver->io_lock;
+    pthread_mutex_lock(lock);
+    uint8_t result = receiver->ops->is_open(receiver);
+    pthread_mutex_unlock(lock);
+    return result;
 }
 
 uint64_t rc_receiver_invalid_frames(const struct rc_receiver *receiver)
@@ -256,14 +427,25 @@ uint64_t rc_receiver_invalid_frames(const struct rc_receiver *receiver)
             receiver->ops->invalid_frames == NULL) {
         return 0U;
     }
-    return receiver->ops->invalid_frames(receiver);
+    pthread_mutex_t *lock = (pthread_mutex_t *)&receiver->io_lock;
+    pthread_mutex_lock(lock);
+    uint64_t result = receiver->ops->invalid_frames(receiver);
+    pthread_mutex_unlock(lock);
+    return result;
 }
 
 int rc_receiver_last_error(const struct rc_receiver *receiver)
 {
-    if (receiver == NULL || receiver->ops == NULL ||
-            receiver->ops->last_error == NULL) {
+    if (receiver == NULL) {
         return 0;
     }
-    return receiver->ops->last_error(receiver);
+    pthread_mutex_t *state = (pthread_mutex_t *)&receiver->state_lock;
+    pthread_mutex_t *io = (pthread_mutex_t *)&receiver->io_lock;
+    pthread_mutex_lock(state);
+    pthread_mutex_lock(io);
+    int result = receiver->callback_error ? receiver->callback_error :
+        (receiver->ops && receiver->ops->last_error ? receiver->ops->last_error(receiver) : 0);
+    pthread_mutex_unlock(io);
+    pthread_mutex_unlock(state);
+    return result;
 }

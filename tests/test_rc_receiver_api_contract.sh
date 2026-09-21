@@ -29,15 +29,16 @@ int main(void)
     if (receiver == 0) {
         return 1;
     }
-    if (rc_receiver_init(receiver) != 0) {
-        rc_receiver_free(receiver);
-        return 1;
-    }
+    /* Pre-init registration validates the public API without hardware. */
     if (rc_receiver_set_callback(receiver, receive_frame, NULL) != 0) {
         rc_receiver_free(receiver);
         return 1;
     }
     if (rc_receiver_set_callback(receiver, NULL, NULL) != 0) {
+        rc_receiver_free(receiver);
+        return 1;
+    }
+    if (rc_receiver_init(receiver) != 0) {
         rc_receiver_free(receiver);
         return 1;
     }

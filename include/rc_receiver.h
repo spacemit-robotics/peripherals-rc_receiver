@@ -106,15 +106,20 @@ int rc_receiver_read(struct rc_receiver *receiver,
 /**
  * Enable or disable asynchronous frame delivery.
  *
- * Registering a callback starts asynchronous delivery in the selected driver.
+ * Registering after init starts the core worker waiting on driver fd events.
+ * Registering before init defers worker startup (and startup errors) to init.
  * Passing NULL as callback stops delivery and waits for any callback in
  * progress to return. The context pointer is borrowed until callback delivery
  * is disabled.
  *
- * Keep callbacks short. Do not call rc_receiver_set_callback(),
- * rc_receiver_close() or rc_receiver_free() from inside the callback.
+ * Keep callbacks short; frame storage is borrowed only during the callback.
+ * Self-unregister is allowed, but an external unregister/close/free must join
+ * the worker before releasing context. Do not register, close or free inside
+ * a callback. Serialize external lifecycle calls; no API may race free.
+ * Fatal fd errors stop delivery and keep synchronous reads blocked (errno
+ * EBUSY). Explicitly unregister and reinitialize to recover; no auto-reconnect.
  *
- * @param receiver Initialized receiver handle.
+ * @param receiver Allocated receiver handle.
  * @param callback Frame callback, or NULL to disable callback delivery.
  * @param context User context passed to callback; ignored when callback is
  *                NULL.

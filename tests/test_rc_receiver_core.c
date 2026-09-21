@@ -184,6 +184,26 @@ static void initialize_callback_state(struct callback_state *state)
     atomic_init(&state->failed, 0);
 }
 
+static void self_unregister(struct rc_receiver *receiver,
+        const struct rc_receiver_frame *frame, void *context)
+{
+    struct callback_state *state = context;
+    assert(rc_receiver_set_callback(receiver, NULL, NULL) == 0);
+    (void)rc_receiver_invalid_frames(receiver);
+    (void)rc_receiver_last_error(receiver);
+    receive_frame(receiver, frame, state);
+}
+
+static void slow_callback(struct rc_receiver *receiver,
+        const struct rc_receiver_frame *frame, void *context)
+{
+    struct callback_state *state = context;
+    const struct timespec delay = {0, 30000000L};
+    receive_frame(receiver, frame, state);
+    (void)nanosleep(&delay, NULL);
+    atomic_store(&state->last_value, 999U);
+}
+
 static uint64_t monotonic_us(void)
 {
     struct timespec now;
@@ -313,13 +333,19 @@ static void test_functional(void)
     master_fd = create_test_pty(slave_path, sizeof(slave_path), &slave_fd);
     receiver = rc_receiver_alloc_uart("sbus:callback", slave_path, 0U, NULL);
     assert(receiver != NULL);
-    assert(rc_receiver_init(receiver) == 0);
     initialize_callback_state(&state);
     assert(rc_receiver_set_callback(receiver, receive_frame, &state) == 0);
+    assert(rc_receiver_init(receiver) == 0);
     wait_for_receiver_open(receiver);
     assert(rc_receiver_read(receiver, &frame) == RC_RECEIVER_ERROR);
 
-    write_test_sbus_frame(master_fd);
+    (void)nanosleep(&delay, NULL);
+    assert(atomic_load(&state.calls) == 0U);
+    assert(write(master_fd, test_sbus_frame, 10) == 10);
+    (void)nanosleep(&delay, NULL);
+    assert(atomic_load(&state.calls) == 0U);
+    assert(write(master_fd, test_sbus_frame + 10, sizeof(test_sbus_frame) - 10) ==
+            (ssize_t)(sizeof(test_sbus_frame) - 10));
     wait_for_callbacks(&state, 1U);
     assert(atomic_load(&state.failed) == 0);
     assert(atomic_load(&state.calls) == 1U);
@@ -334,11 +360,19 @@ static void test_functional(void)
     assert(frame.channels[0] == 5507U);
 
     assert(rc_receiver_set_callback(receiver, receive_frame, &state) == 0);
+    (void)close(master_fd);
+    for (unsigned int attempt = 0; attempt < TEST_WAIT_ATTEMPTS &&
+            rc_receiver_last_error(receiver) == 0; ++attempt)
+        (void)nanosleep(&delay, NULL);
+    assert(rc_receiver_last_error(receiver) == EIO);
+    assert(rc_receiver_read(receiver, &frame) == RC_RECEIVER_ERROR);
+    assert(errno == EBUSY);
+    assert(rc_receiver_set_callback(receiver, receive_frame, &state) == RC_RECEIVER_ERROR);
+    assert(rc_receiver_set_callback(receiver, NULL, NULL) == 0);
     rc_receiver_close(receiver);
     assert(rc_receiver_is_open(receiver) == 0U);
     rc_receiver_free(receiver);
     (void)close(slave_fd);
-    (void)close(master_fd);
 }
 
 static void test_error_paths(void)
@@ -407,7 +441,8 @@ static void test_error_paths(void)
             "/dev/rc_receiver_test_missing_uart", 0U, NULL);
     assert(receiver != NULL);
     assert(rc_receiver_init(receiver) == 0);
-    assert(rc_receiver_set_callback(receiver, receive_frame, &state) == 0);
+    assert(rc_receiver_set_callback(receiver, receive_frame, &state) == RC_RECEIVER_ERROR);
+    assert(rc_receiver_last_error(receiver) == ENOENT);
     (void)nanosleep(&delay, NULL);
     start_us = monotonic_us();
     rc_receiver_free(receiver);
@@ -443,7 +478,15 @@ static void test_stability(void)
 
     assert(atomic_load(&state.failed) == 0);
     assert(atomic_load(&state.last_value) == 5507U);
+    assert(rc_receiver_set_callback(receiver, self_unregister, &state) == 0);
+    write_test_sbus_frame(master_fd);
+    wait_for_callbacks(&state, TEST_CALLBACK_CYCLES + 1U);
+    assert(rc_receiver_set_callback(receiver, NULL, NULL) == 0);
+    assert(rc_receiver_set_callback(receiver, slow_callback, &state) == 0);
+    write_test_sbus_frame(master_fd);
+    wait_for_callbacks(&state, TEST_CALLBACK_CYCLES + 2U);
     rc_receiver_free(receiver);
+    assert(atomic_load(&state.last_value) == 999U);
     (void)close(slave_fd);
     (void)close(master_fd);
 }
